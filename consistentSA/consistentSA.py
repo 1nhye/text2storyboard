@@ -16,6 +16,7 @@ if is_torch2_available():
         AttnProcessor2_0 as AttnProcessor
 else:
     from .consistentSA_utils  import AttnProcessor
+# from .consistentSA_utils  import AttnProcessor
 
 import diffusers
 from diffusers import StableDiffusionXLPipeline
@@ -31,6 +32,114 @@ from diffusers.utils import load_image
 # STYLE_NAMES = list(styles.keys())
 # DEFAULT_STYLE_NAME = "(No style)"
 MAX_SEED = np.iinfo(np.int32).max
+
+# class AttnStore2_0(torch.nn.Module):
+#     r"""
+#     Processor for collecting Cross Attention map (enabled by default if you're using PyTorch 2.0).
+#     """
+#     attn_probs = []
+#     attn_store = None
+    
+#     attn_count = 0
+    
+#     def __init__(
+#         self,
+#         hidden_size=None,
+#         cross_attention_dim=None,
+#         total_count=36,
+#         res=16,
+#     ):
+#         super().__init__()
+#         if not hasattr(F, "scaled_dot_product_attention"):
+#             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
+        
+#         self.total_count = total_count
+#         self.res = res
+        
+#     def after_step(self):
+#         self.__class__.attn_count = 0
+#         self.__class__.attn_store = torch.mean(self.__class__.attn_probs)
+
+#     def __call__(
+#         self,
+#         attn,
+#         hidden_states,
+#         encoder_hidden_states=None,
+#         attention_mask=None,
+#         temb=None,
+#     ):
+#         residual = hidden_states
+
+#         if attn.spatial_norm is not None:
+#             hidden_states = attn.spatial_norm(hidden_states, temb)
+
+#         input_ndim = hidden_states.ndim
+
+#         if input_ndim == 4:
+#             batch_size, channel, height, width = hidden_states.shape
+#             hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+#         batch_size, sequence_length, _ = (
+#             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+#         )
+
+#         if attention_mask is not None:
+#             attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+#             # scaled_dot_product_attention expects attention_mask shape to be
+#             # (batch, heads, source_length, target_length)
+#             attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+
+#         if attn.group_norm is not None:
+#             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+#         query = attn.to_q(hidden_states)
+
+#         if encoder_hidden_states is None:
+#             encoder_hidden_states = hidden_states
+#         elif attn.norm_cross:
+#             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+#         key = attn.to_k(encoder_hidden_states)
+#         value = attn.to_v(encoder_hidden_states)
+
+#         inner_dim = key.shape[-1]
+#         head_dim = inner_dim // attn.heads
+
+#         query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+#         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+#         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+#         # the output of sdp = (batch, num_heads, seq_len, head_dim)
+#         # TODO: add support for attn.scale when we move to Torch 2.1
+#         hidden_states = F.scaled_dot_product_attention(
+#             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+#         )
+
+#         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+#         hidden_states = hidden_states.to(query.dtype)
+
+#         # linear proj
+#         hidden_states = attn.to_out[0](hidden_states)
+#         # dropout
+#         hidden_states = attn.to_out[1](hidden_states)
+
+#         if input_ndim == 4:
+#             hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+#         if attn.residual_connection:
+#             hidden_states = hidden_states + residual
+
+#         hidden_states = hidden_states / attn.rescale_output_factor
+        
+        
+#         self.__class__.attn_count +=1
+#         # print("count:", self.__class__.attn_count)
+#         # print("step:", self.__class__.cur_step)
+#         if self.__class__.attn_count == self.total_count:
+#             self.after_step()
+
+#         return hidden_states
     
 #################################################
 ########Consistent Self-Attention################
@@ -55,7 +164,7 @@ class SpatialAttnProcessor2_0(torch.nn.Module):
     attn_count = 0
     cur_step = 0
 
-    def __init__(self, hidden_size = None, cross_attention_dim=None,id_length = 4,device = "cuda",dtype = torch.float16, sa32=0.5, sa64=0.5, height=768, width=768, total_count=36, total_step=50):
+    def __init__(self, hidden_size = None, cross_attention_dim=None, id_length = 4, device = "cuda", dtype = torch.float16, sa32=0.5, sa64=0.5, height=768, width=768, total_count=36, total_step=50):
         super().__init__()
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
@@ -283,8 +392,8 @@ class SpatialAttnProcessor2_0(torch.nn.Module):
 
         return hidden_states
 
-def set_attention_processor(unet, id_length, sa32, sa64):
-    total_count = 0
+def set_attention_processor(unet, id_length, device="cuda", dtype=torch.float16, sa32=0.5, sa64=0.5, height=768, width=768, total_count=36, total_step=50):
+    attention_counter = 0
     
     attn_procs = {}
     for name in unet.attn_processors.keys():
@@ -299,15 +408,15 @@ def set_attention_processor(unet, id_length, sa32, sa64):
             hidden_size = unet.config.block_out_channels[block_id]
         if cross_attention_dim is None:
             if name.startswith("up_blocks") :
-                attn_procs[name] = SpatialAttnProcessor2_0(id_length = id_length, sa32 = sa32, sa64 = sa64)
-                total_count += 1
+                attn_procs[name] = SpatialAttnProcessor2_0(id_length=id_length, device=device, dtype=dtype, sa32=sa32, sa64=sa64, height=height, width=width, total_count=total_count, total_step=total_step)
+                attention_counter += 1
             else:    
                 attn_procs[name] = AttnProcessor()
         else:
             attn_procs[name] = AttnProcessor()
 
     unet.set_attn_processor(attn_procs)
-    return total_count
+    return attention_counter
 
 def setup_seed(seed):
     torch.manual_seed(seed)
